@@ -2,7 +2,8 @@ name: Telegram News Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    # 08–21 по Москве (UTC+3): 5,6,8,9,11,12,14,15,17,18 UTC в :00
+    - cron: "0 5,6,8,9,11,12,14,15,17,18 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +16,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 12
 
     steps:
       - name: Checkout
@@ -43,7 +44,6 @@ jobs:
           TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
-          PUBLISH_INTERVAL_MINUTES: "5"
           STATE_FILE: state.json
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -52,6 +52,8 @@ jobs:
           TG_PASSWORD: ${{ secrets.TG_PASSWORD }}
           ENABLE_RSS: "false"
           RUN_ONCE: "true"
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python main.py
 
       - name: Save bot runtime files

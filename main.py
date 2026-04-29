@@ -6,6 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,6 +31,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("news-bot")
 
+# Часы публикаций по Москве (по умолчанию — как в ТЗ). Можно переопределить: PUBLISH_SCHEDULE_MSK=8,9,11,...
+DEFAULT_PUBLISH_SCHEDULE_MSK: List[int] = [8, 9, 11, 12, 14, 15, 17, 18, 20, 21]
+MSK_TZ = ZoneInfo("Europe/Moscow")
+
 
 @dataclass
 class Config:
@@ -37,7 +42,7 @@ class Config:
     telegram_channel_id: str
     openai_api_key: Optional[str]
     openai_model: str
-    publish_interval_minutes: int
+    schedule_msk_hours: List[int]
     state_file: Path
     sources_file: Path
     tg_sources_file: Path
@@ -58,6 +63,7 @@ class StateStore:
             "last_run": None,
             "last_posted_at": None,
             "last_channel_index": -1,
+            "last_publish_slot": None,
         }
         self._load()
 
@@ -74,6 +80,7 @@ class StateStore:
             ("last_channel_index", -1),
             ("last_run", None),
             ("last_posted_at", None),
+            ("last_publish_slot", None),
         ):
             if key not in self.state:
                 self.state[key] = default
@@ -90,7 +97,7 @@ class StateStore:
     def is_content_seen(self, content_hash: str) -> bool:
         return content_hash in self.state.get("posted_content_hashes", [])
 
-    def mark_posted(self, link: str, content_hash: str, channel_index: int) -> None:
+    def mark_posted(self, link: str, content_hash: str, channel_index: int, publish_slot: str) -> None:
         posted_links = self.state["posted_links"]
         posted_links.append(link)
         # Храним последние 2000 ссылок, чтобы реже повторять старые посты при сбросе артефактов.
@@ -101,18 +108,13 @@ class StateStore:
         self.state["last_channel_index"] = channel_index
         self.state["last_run"] = datetime.now(timezone.utc).isoformat()
         self.state["last_posted_at"] = datetime.now(timezone.utc).isoformat()
+        self.state["last_publish_slot"] = publish_slot
         self.save()
 
-    def can_publish_now(self, min_interval_minutes: int) -> bool:
-        last_posted_at = self.state.get("last_posted_at")
-        if not last_posted_at:
+    def can_publish_slot(self, slot_key: str) -> bool:
+        if slot_key.startswith("dispatch-"):
             return True
-        try:
-            last_dt = datetime.fromisoformat(last_posted_at.replace("Z", "+00:00"))
-        except ValueError:
-            return True
-        delta_seconds = (datetime.now(timezone.utc) - last_dt).total_seconds()
-        return delta_seconds >= (min_interval_minutes * 60)
+        return self.state.get("last_publish_slot") != slot_key
 
 
 class NewsCollector:
@@ -513,6 +515,32 @@ class TelegramMediaFetcher:
         return asyncio.run(self._fetch_async(link))
 
 
+def parse_schedule_msk_hours() -> List[int]:
+    raw = os.getenv("PUBLISH_SCHEDULE_MSK", "").strip()
+    if not raw:
+        return list(DEFAULT_PUBLISH_SCHEDULE_MSK)
+    out: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            h = int(part)
+            if 0 <= h <= 23:
+                out.append(h)
+    return sorted(set(out)) or list(DEFAULT_PUBLISH_SCHEDULE_MSK)
+
+
+def compute_publish_slot_key(schedule_hours: List[int]) -> str:
+    """Один пост на слот дня; workflow_dispatch — отдельный слот на каждый запуск."""
+    ev = os.getenv("GITHUB_EVENT_NAME", "").strip()
+    rid = os.getenv("GITHUB_RUN_ID", "").strip()
+    if ev == "workflow_dispatch" and rid:
+        return f"dispatch-{rid}"
+    now = datetime.now(MSK_TZ)
+    if now.hour in schedule_hours:
+        return f"{now.date().isoformat()}-H{now.hour:02d}"
+    return f"adhoc-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M')}"
+
+
 def load_config() -> Config:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     channel = os.getenv("TELEGRAM_CHANNEL_ID", "").strip()
@@ -520,7 +548,7 @@ def load_config() -> Config:
         raise ValueError("TELEGRAM_BOT_TOKEN и TELEGRAM_CHANNEL_ID обязательны.")
 
     openai_key = os.getenv("OPENAI_API_KEY", "").strip() or None
-    interval = int(os.getenv("PUBLISH_INTERVAL_MINUTES", "5"))
+    schedule_msk_hours = parse_schedule_msk_hours()
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
     state_file = Path(os.getenv("STATE_FILE", "state.json")).resolve()
     sources_file = Path("sources.json").resolve()
@@ -538,7 +566,7 @@ def load_config() -> Config:
         telegram_channel_id=channel,
         openai_api_key=openai_key,
         openai_model=model,
-        publish_interval_minutes=interval,
+        schedule_msk_hours=schedule_msk_hours,
         state_file=state_file,
         sources_file=sources_file,
         tg_sources_file=tg_sources_file,
@@ -628,12 +656,13 @@ def run_once(
     publisher: TelegramPublisher,
     media_fetcher: TelegramMediaFetcher,
     state: StateStore,
-    publish_interval_minutes: int,
+    schedule_msk_hours: List[int],
     ordered_tg_channels: List[str],
 ) -> None:
     logger.info("Запуск цикла публикации...")
-    if not state.can_publish_now(min_interval_minutes=publish_interval_minutes):
-        logger.info("Пропуск: лимит 1 пост каждые %s минут.", publish_interval_minutes)
+    slot_key = compute_publish_slot_key(schedule_msk_hours)
+    if not state.can_publish_slot(slot_key):
+        logger.info("Пропуск: слот уже отработан (%s).", slot_key)
         return
 
     news_items = collector.get_latest_news(max_items=40)
@@ -655,7 +684,7 @@ def run_once(
     if str(selected.get("source", "")).startswith("telegram:"):
         media = media_fetcher.fetch(selected["link"])
     publisher.publish(post_text, media=media)
-    state.mark_posted(selected["link"], content_fingerprint(selected), channel_index)
+    state.mark_posted(selected["link"], content_fingerprint(selected), channel_index, slot_key)
     logger.info("Опубликовано: %s", selected["title"])
 
 
@@ -687,44 +716,42 @@ def main() -> None:
         session_name=config.tg_session_name,
     )
 
-    # Мгновенный запуск при старте.
-    run_once(
-        collector,
-        generator,
-        publisher,
-        media_fetcher,
-        state,
-        config.publish_interval_minutes,
-        tg_channels,
-    )
+    run_startup = os.getenv("RUN_STARTUP_POST", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if config.run_once or run_startup:
+        run_once(
+            collector,
+            generator,
+            publisher,
+            media_fetcher,
+            state,
+            config.schedule_msk_hours,
+            tg_channels,
+        )
     if config.run_once:
         logger.info("RUN_ONCE=true, завершаю процесс после одного цикла.")
         return
 
-    scheduler = BlockingScheduler(timezone="UTC")
+    hour_str = ",".join(str(h) for h in sorted(set(config.schedule_msk_hours)))
+    scheduler = BlockingScheduler(timezone=MSK_TZ)
     scheduler.add_job(
         run_once,
-        CronTrigger(
-            minute=f"*/{max(1, min(59, config.publish_interval_minutes))}",
-            timezone="UTC",
-        ),
+        CronTrigger(minute="0", hour=hour_str, timezone=MSK_TZ),
         args=[
             collector,
             generator,
             publisher,
             media_fetcher,
             state,
-            config.publish_interval_minutes,
+            config.schedule_msk_hours,
             tg_channels,
         ],
         max_instances=1,
         coalesce=True,
-        misfire_grace_time=120,
+        misfire_grace_time=300,
     )
     logger.info(
-        "Планировщик UTC: пост не чаще 1 раз в %s мин; cron */%s по минутам.",
-        config.publish_interval_minutes,
-        max(1, min(59, config.publish_interval_minutes)),
+        "Планировщик Europe/Moscow: посты в часы %s (RUN_STARTUP_POST=true — доп. пост при старте).",
+        config.schedule_msk_hours,
     )
     scheduler.start()
 
