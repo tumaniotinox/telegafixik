@@ -1,8 +1,8 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
-import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import feedparser
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -51,7 +52,13 @@ class Config:
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
-        self.state = {"posted_links": [], "last_run": None, "last_posted_at": None}
+        self.state = {
+            "posted_links": [],
+            "posted_content_hashes": [],
+            "last_run": None,
+            "last_posted_at": None,
+            "last_channel_index": -1,
+        }
         self._load()
 
     def _load(self) -> None:
@@ -61,6 +68,15 @@ class StateStore:
             self.state = json.loads(self.path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             logger.warning("Не удалось прочитать state-файл, создаю новый.")
+        for key, default in (
+            ("posted_links", []),
+            ("posted_content_hashes", []),
+            ("last_channel_index", -1),
+            ("last_run", None),
+            ("last_posted_at", None),
+        ):
+            if key not in self.state:
+                self.state[key] = default
 
     def save(self) -> None:
         self.path.write_text(
@@ -71,11 +87,18 @@ class StateStore:
     def is_posted(self, link: str) -> bool:
         return link in self.state["posted_links"]
 
-    def mark_posted(self, link: str) -> None:
+    def is_content_seen(self, content_hash: str) -> bool:
+        return content_hash in self.state.get("posted_content_hashes", [])
+
+    def mark_posted(self, link: str, content_hash: str, channel_index: int) -> None:
         posted_links = self.state["posted_links"]
         posted_links.append(link)
-        # Храним последние 1000 ссылок, чтобы файл не рос бесконечно.
-        self.state["posted_links"] = posted_links[-1000:]
+        # Храним последние 2000 ссылок, чтобы реже повторять старые посты при сбросе артефактов.
+        self.state["posted_links"] = posted_links[-2000:]
+        hashes = self.state.get("posted_content_hashes", [])
+        hashes.append(content_hash)
+        self.state["posted_content_hashes"] = hashes[-2000:]
+        self.state["last_channel_index"] = channel_index
         self.state["last_run"] = datetime.now(timezone.utc).isoformat()
         self.state["last_posted_at"] = datetime.now(timezone.utc).isoformat()
         self.save()
@@ -317,7 +340,13 @@ class PostGenerator:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "Пиши лаконично и фактологично."},
+                    {
+                        "role": "system",
+                        "content": (
+                            "Пиши лаконично и фактологично. Запрещено: слово «источник», "
+                            "любые URL и ссылки, упоминания каналов-источников, копипаст исходного текста."
+                        ),
+                    },
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.6,
@@ -331,18 +360,49 @@ class PostGenerator:
 
         return self._fallback(news)
 
-    @staticmethod
-    def sanitize(text: str) -> str:
+    _BANNED_SUBSTRINGS = (
+        "источник",
+        "источники",
+        "source:",
+        "source ",
+        "по ссылке",
+        "подробнее",
+        "оригинал",
+        "материал",
+        "читать также",
+        "читать в оригинале",
+        "полный текст",
+        "ссылка:",
+        "url:",
+        "telegram.me",
+        "read more",
+        "full story",
+    )
+
+    @classmethod
+    def sanitize(cls, text: str) -> str:
+        if not text:
+            return ""
+        cleaned = text
+        cleaned = re.sub(r"https?://[^\s)\]>\u2019\"']+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"www\.[^\s)\]>\u2019\"']+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:https?://)?t\.me/[^\s)\]>\u2019\"']+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"telegram\.me/[^\s)\]>\u2019\"']+", "", cleaned, flags=re.IGNORECASE)
+
         cleaned_lines: List[str] = []
-        for line in text.splitlines():
+        for line in cleaned.splitlines():
             lower = line.lower()
-            if "источник" in lower:
+            if any(b in lower for b in cls._BANNED_SUBSTRINGS):
                 continue
-            if "http://" in lower or "https://" in lower or "t.me/" in lower:
+            if re.search(r"https?://", lower) or "t.me/" in lower:
+                continue
+            line = line.strip()
+            if not line:
                 continue
             cleaned_lines.append(line)
         cleaned = "\n".join(cleaned_lines).strip()
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         return cleaned[:4096]
 
 
@@ -384,7 +444,7 @@ class TelegramPublisher:
                 json={
                     "chat_id": self.channel_id,
                     "text": text[:4096],
-                    "disable_web_page_preview": False,
+                    "disable_web_page_preview": True,
                 },
                 timeout=30,
             )
@@ -491,6 +551,13 @@ def load_config() -> Config:
     )
 
 
+def content_fingerprint(item: Dict[str, Any]) -> str:
+    title = (item.get("title") or "").strip()
+    summary = (item.get("summary") or "").strip()
+    blob = re.sub(r"\s+", " ", f"{title}\n{summary[:800]}").strip().lower()
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def load_sources(path: Path, file_hint: str) -> List[str]:
     if not path.exists():
         raise FileNotFoundError(
@@ -505,29 +572,54 @@ def load_sources(path: Path, file_hint: str) -> List[str]:
     return sources
 
 
-def choose_unposted(news_items: List[Dict[str, Any]], state: StateStore) -> Optional[Dict[str, Any]]:
-    unposted = [item for item in news_items if not state.is_posted(item["link"])]
-    if not unposted:
-        return None
+def choose_unposted(
+    news_items: List[Dict[str, Any]],
+    state: StateStore,
+    ordered_tg_channels: List[str],
+) -> Optional[Tuple[Dict[str, Any], int]]:
+    """По очереди каналов (как в tg_sources.json), без повторов по ссылке и по отпечатку текста."""
+    ordered_keys = [
+        f"telegram:{TelegramChannelCollector._channel_to_username(ch)}"
+        for ch in ordered_tg_channels
+    ]
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
-    for item in unposted:
-        grouped.setdefault(item["source"], []).append(item)
+    for item in news_items:
+        sk = item.get("source", "")
+        if not sk.startswith("telegram:"):
+            continue
+        grouped.setdefault(sk, []).append(item)
 
-    candidate_sources = []
-    source_to_candidates: Dict[str, List[Dict[str, Any]]] = {}
-    for source, items in grouped.items():
-        items.sort(key=lambda x: x["published_at"], reverse=True)
-        fresh_items = items[:3]
-        if fresh_items:
-            candidate_sources.append(source)
-            source_to_candidates[source] = fresh_items
+    for sk in grouped:
+        arr = grouped[sk]
+        arr.sort(key=lambda x: x["published_at"], reverse=True)
+        grouped[sk] = arr[:5]
 
-    if not candidate_sources:
-        return None
+    last_idx = int(state.state.get("last_channel_index", -1))
+    n = len(ordered_keys)
+    if n > 0:
+        for step in range(n):
+            idx = (last_idx + 1 + step) % n
+            source_key = ordered_keys[idx]
+            pool = grouped.get(source_key) or []
+            for cand in pool:
+                if state.is_posted(cand["link"]):
+                    continue
+                if state.is_content_seen(content_fingerprint(cand)):
+                    continue
+                return cand, idx
 
-    picked_source = random.choice(candidate_sources)
-    return random.choice(source_to_candidates[picked_source])
+    for item in sorted(news_items, key=lambda x: x["published_at"], reverse=True):
+        sk = item.get("source", "")
+        if sk.startswith("telegram:"):
+            continue
+        if state.is_posted(item["link"]):
+            continue
+        if state.is_content_seen(content_fingerprint(item)):
+            continue
+        return item, -1
+
+    return None
 
 
 def run_once(
@@ -537,6 +629,7 @@ def run_once(
     media_fetcher: TelegramMediaFetcher,
     state: StateStore,
     publish_interval_minutes: int,
+    ordered_tg_channels: List[str],
 ) -> None:
     logger.info("Запуск цикла публикации...")
     if not state.can_publish_now(min_interval_minutes=publish_interval_minutes):
@@ -548,10 +641,11 @@ def run_once(
         logger.info("Новости не найдены.")
         return
 
-    selected = choose_unposted(news_items, state)
-    if not selected:
-        logger.info("Новых новостей пока нет.")
+    picked = choose_unposted(news_items, state, ordered_tg_channels)
+    if not picked:
+        logger.info("Новых уникальных постов пока нет.")
         return
+    selected, channel_index = picked
 
     post_text = generator.sanitize(generator.generate(selected))
     if not post_text:
@@ -561,7 +655,7 @@ def run_once(
     if str(selected.get("source", "")).startswith("telegram:"):
         media = media_fetcher.fetch(selected["link"])
     publisher.publish(post_text, media=media)
-    state.mark_posted(selected["link"])
+    state.mark_posted(selected["link"], content_fingerprint(selected), channel_index)
     logger.info("Опубликовано: %s", selected["title"])
 
 
@@ -601,6 +695,7 @@ def main() -> None:
         media_fetcher,
         state,
         config.publish_interval_minutes,
+        tg_channels,
     )
     if config.run_once:
         logger.info("RUN_ONCE=true, завершаю процесс после одного цикла.")
@@ -609,8 +704,10 @@ def main() -> None:
     scheduler = BlockingScheduler(timezone="UTC")
     scheduler.add_job(
         run_once,
-        "interval",
-        minutes=config.publish_interval_minutes,
+        CronTrigger(
+            minute=f"*/{max(1, min(59, config.publish_interval_minutes))}",
+            timezone="UTC",
+        ),
         args=[
             collector,
             generator,
@@ -618,11 +715,17 @@ def main() -> None:
             media_fetcher,
             state,
             config.publish_interval_minutes,
+            tg_channels,
         ],
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=120,
     )
-    logger.info("Планировщик запущен: каждые %s мин.", config.publish_interval_minutes)
+    logger.info(
+        "Планировщик UTC: пост не чаще 1 раз в %s мин; cron */%s по минутам.",
+        config.publish_interval_minutes,
+        max(1, min(59, config.publish_interval_minutes)),
+    )
     scheduler.start()
 
 
