@@ -1,0 +1,63 @@
+name: Telegram News Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore bot runtime files
+        uses: actions/download-artifact@v4
+        with:
+          name: bot-runtime
+          path: .
+        continue-on-error: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one bot cycle
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          PUBLISH_INTERVAL_MINUTES: "5"
+          STATE_FILE: state.json
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_PHONE: ${{ secrets.TG_PHONE }}
+          TG_SESSION_NAME: tg_news_session
+          TG_PASSWORD: ${{ secrets.TG_PASSWORD }}
+          ENABLE_RSS: "false"
+          RUN_ONCE: "true"
+        run: python main.py
+
+      - name: Save bot runtime files
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bot-runtime
+          path: |
+            state.json
+            tg_news_session.session
+            tg_news_session.session-journal
+          if-no-files-found: ignore
+          retention-days: 30
