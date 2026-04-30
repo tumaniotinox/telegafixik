@@ -18,8 +18,10 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.errors import PhoneCodeInvalidError
 from telethon.errors import SessionPasswordNeededError
+from telethon.sessions import StringSession
 import requests
 
 
@@ -50,6 +52,7 @@ class Config:
     tg_api_hash: Optional[str]
     tg_phone: Optional[str]
     tg_session_name: str
+    tg_string_session: Optional[str]
     enable_rss: bool
     run_once: bool
 
@@ -184,12 +187,14 @@ class TelegramChannelCollector:
         api_hash: Optional[str],
         phone: Optional[str],
         session_name: str,
+        string_session: Optional[str],
     ):
         self.channels = channels
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone = phone
         self.session_name = session_name
+        self.string_session = string_session
 
     @staticmethod
     def _clean_text(value: str) -> str:
@@ -215,12 +220,22 @@ class TelegramChannelCollector:
             logger.info("TG_API_ID/TG_API_HASH не заданы, пропускаю Telegram-каналы.")
             return []
 
-        client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+        if self.string_session:
+            client = TelegramClient(
+                StringSession(self.string_session),
+                self.api_id,
+                self.api_hash,
+            )
+        else:
+            client = TelegramClient(self.session_name, self.api_id, self.api_hash)
         await client.connect()
         items: List[Dict[str, Any]] = []
 
         try:
             if not await client.is_user_authorized():
+                if self.string_session:
+                    logger.warning("TG_STRING_SESSION не авторизована. Обнови секрет.")
+                    return []
                 if not self.phone:
                     logger.warning("TG_PHONE не задан. Для Telegram-парсинга нужна авторизация.")
                     return []
@@ -235,6 +250,12 @@ class TelegramChannelCollector:
                     await client.sign_in(phone=self.phone, code=code)
                 except PhoneCodeInvalidError:
                     logger.warning("Код TG_CODE неверный. Обнови код в .env и перезапусти.")
+                    return []
+                except FloodWaitError as exc:
+                    logger.warning(
+                        "Telegram ограничил выдачу кодов (FloodWait %s сек). Используй TG_STRING_SESSION.",
+                        exc.seconds,
+                    )
                     return []
                 except SessionPasswordNeededError:
                     password = os.getenv("TG_PASSWORD", "").strip()
@@ -558,6 +579,7 @@ def load_config() -> Config:
     tg_api_hash = os.getenv("TG_API_HASH", "").strip() or None
     tg_phone = os.getenv("TG_PHONE", "").strip() or None
     tg_session_name = os.getenv("TG_SESSION_NAME", "tg_news_session").strip()
+    tg_string_session = os.getenv("TG_STRING_SESSION", "").strip() or None
     enable_rss = os.getenv("ENABLE_RSS", "false").strip().lower() in {"1", "true", "yes", "on"}
     run_once = os.getenv("RUN_ONCE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -574,6 +596,7 @@ def load_config() -> Config:
         tg_api_hash=tg_api_hash,
         tg_phone=tg_phone,
         tg_session_name=tg_session_name,
+        tg_string_session=tg_string_session,
         enable_rss=enable_rss,
         run_once=run_once,
     )
@@ -703,6 +726,7 @@ def main() -> None:
         api_hash=config.tg_api_hash,
         phone=config.tg_phone,
         session_name=config.tg_session_name,
+        string_session=config.tg_string_session,
     )
     collector = CombinedCollector(rss_collector, tg_collector)
     generator = PostGenerator(config.openai_api_key, config.openai_model)

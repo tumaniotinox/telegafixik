@@ -49,6 +49,7 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_PHONE: ${{ secrets.TG_PHONE }}
           TG_SESSION_NAME: tg_news_session
+          TG_STRING_SESSION: ${{ secrets.TG_STRING_SESSION }}
           TG_PASSWORD: ${{ secrets.TG_PASSWORD }}
           TG_CODE: ${{ secrets.TG_CODE }}
           ENABLE_RSS: "false"
