@@ -50,6 +50,7 @@ jobs:
           TG_PHONE: ${{ secrets.TG_PHONE }}
           TG_SESSION_NAME: tg_news_session
           TG_PASSWORD: ${{ secrets.TG_PASSWORD }}
+          TG_CODE: ${{ secrets.TG_CODE }}
           ENABLE_RSS: "false"
           RUN_ONCE: "true"
           GITHUB_EVENT_NAME: ${{ github.event_name }}
